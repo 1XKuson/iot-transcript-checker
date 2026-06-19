@@ -1,12 +1,14 @@
 import { NextRequest } from "next/server"
 import { prisma } from "@/lib/prisma"
 import { stringSimilarity } from "string-similarity-js"
+import Tesseract from "tesseract.js"
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
 const ALLOWED_TYPES = ["application/pdf", "image/jpeg", "image/png", "image/jpg"]
 const ALLOWED_EXTENSIONS = [".pdf", ".jpg", ".jpeg", ".png"]
+const GRADES = new Set(["A", "B+", "B", "C+", "C", "D+", "D", "F", "W", "S", "U", "I", "P", "IP"])
 
-interface LlmCourseEntry {
+interface CourseEntry {
   courseCode: string
   courseName: string
   credits: number | null
@@ -22,8 +24,84 @@ function deriveStatus(grade: string | null): string {
 }
 
 function normalizeCode(code: string): string {
-  // Strip all non-digit chars, then pad back to 8 digits
   return code.replace(/\D/g, "").padStart(8, "0")
+}
+
+async function extractText(buffer: Buffer, mimeType: string): Promise<string> {
+  if (mimeType === "application/pdf") {
+    const { PDFParse } = await import("pdf-parse")
+    const parser = new PDFParse({ data: buffer })
+    const result = await parser.getText()
+    const text = result.text
+    return text
+  }
+
+  const worker = await Tesseract.createWorker("tha+eng")
+  try {
+    const { data } = await worker.recognize(buffer)
+    return data.text
+  } finally {
+    await worker.terminate()
+  }
+}
+
+function parseTranscriptText(text: string): CourseEntry[] {
+  const entries: CourseEntry[] = []
+  const normalized = text.replace(/\r\n/g, "\n")
+
+  const codeMatches = [...normalized.matchAll(/\b(\d{7,8})\b/g)]
+
+  for (let i = 0; i < codeMatches.length; i++) {
+    const codeMatch = codeMatches[i]
+    const code = codeMatch[1]
+    const startIdx = codeMatch.index! + code.length
+    const endIdx = codeMatches[i + 1]?.index ?? normalized.length
+
+    const tokens = normalized
+      .slice(startIdx, endIdx)
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+
+    const remaining = [...tokens]
+    let grade: string | null = null
+    let credits: number | null = null
+    let semesterLabel: string | null = null
+
+    // Extract semester (e.g. "1/2565")
+    const semIdx = remaining.findIndex((t) => /^\d\/\d{4}$/.test(t))
+    if (semIdx !== -1) {
+      semesterLabel = remaining.splice(semIdx, 1)[0]
+    }
+
+    // Extract grade — last token from right that matches
+    for (let j = remaining.length - 1; j >= 0; j--) {
+      if (GRADES.has(remaining[j])) {
+        grade = remaining.splice(j, 1)[0]
+        break
+      }
+    }
+
+    // Extract credits — last numeric token from right in range 1–9
+    for (let j = remaining.length - 1; j >= 0; j--) {
+      const num = parseFloat(remaining[j])
+      if (!isNaN(num) && num >= 1 && num <= 9 && /^\d+(?:\.\d+)?$/.test(remaining[j])) {
+        credits = num
+        remaining.splice(j, 1)
+        break
+      }
+    }
+
+    entries.push({
+      courseCode: code,
+      courseName: remaining.join(" ").trim(),
+      credits,
+      grade,
+      semesterLabel,
+    })
+  }
+
+  return entries
 }
 
 export async function POST(request: NextRequest) {
@@ -35,7 +113,6 @@ export async function POST(request: NextRequest) {
       return Response.json({ error: "ไม่พบไฟล์" }, { status: 400 })
     }
 
-    // Validate size
     if (file.size > MAX_FILE_SIZE) {
       return Response.json(
         { error: "ไฟล์มีขนาดใหญ่เกินไป (สูงสุด 10MB)" },
@@ -43,7 +120,6 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Validate MIME type
     if (!ALLOWED_TYPES.includes(file.type)) {
       return Response.json(
         { error: "รองรับเฉพาะไฟล์ PDF, JPG, และ PNG เท่านั้น" },
@@ -51,173 +127,57 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Validate extension
     const ext = "." + file.name.split(".").pop()?.toLowerCase()
     if (!ALLOWED_EXTENSIONS.includes(ext)) {
-      return Response.json(
-        { error: "นามสกุลไฟล์ไม่ถูกต้อง" },
-        { status: 400 }
-      )
+      return Response.json({ error: "นามสกุลไฟล์ไม่ถูกต้อง" }, { status: 400 })
     }
 
-    // Convert to base64
-    const arrayBuffer = await file.arrayBuffer()
-    const base64 = Buffer.from(arrayBuffer).toString("base64")
+    const buffer = Buffer.from(await file.arrayBuffer())
 
-    // Create student (anonymous shared)
-    let student = await prisma.student.findFirst({
-      where: { name: "anonymous" },
-    })
+    let student = await prisma.student.findFirst({ where: { name: "anonymous" } })
     if (!student) {
-      student = await prisma.student.create({
-        data: { name: "anonymous" },
-      })
+      student = await prisma.student.create({ data: { name: "anonymous" } })
     }
 
-    // Create upload record
     const upload = await prisma.transcriptUpload.create({
-      data: {
-        studentId: student.id,
-        fileName: file.name,
-        status: "processing",
-      },
+      data: { studentId: student.id, fileName: file.name, status: "processing" },
     })
 
-    // Call Gemini API
-    const apiKey = process.env.GEMINI_API_KEY
-    if (!apiKey || apiKey === "your-api-key-here") {
-      // Return mock data for UI testing
-      const mockEntries: LlmCourseEntry[] = [
-        {
-          courseCode: "01006030",
-          courseName: "แคลคูลัส 1",
-          credits: 3,
-          grade: "A",
-          semesterLabel: "1/2565",
-        },
-        {
-          courseCode: "01006012",
-          courseName: "การเขียนโปรแกรมคอมพิวเตอร์",
-          credits: 3,
-          grade: "B+",
-          semesterLabel: "1/2565",
-        },
-        {
-          courseCode: "01006020",
-          courseName: "ฟิสิกส์ทั่วไป 1",
-          credits: 3,
-          grade: "B",
-          semesterLabel: "1/2565",
-        },
-        {
-          courseCode: "01236255",
-          courseName: "พื้นฐานระบบไอโอที",
-          credits: 3,
-          grade: "A",
-          semesterLabel: "1/2565",
-        },
-        {
-          courseCode: "90642118",
-          courseName: "โปรแกรมคอมพิวเตอร์ประยุกต์ทางธุรกิจ",
-          credits: 2,
-          grade: "B",
-          semesterLabel: "1/2565",
-        },
-        {
-          courseCode: "01236254",
-          courseName: "วงจรไฟฟ้าและอิเล็กทรอนิกส์",
-          credits: 3,
-          grade: "C+",
-          semesterLabel: "1/2565",
-        },
-        {
-          courseCode: "01236257",
-          courseName: "การเขียนโปรแกรมเชิงวัตถุ",
-          credits: 3,
-          grade: null,
-          semesterLabel: "2/2566",
-        },
-      ]
-
-      await processEntries(upload.id, mockEntries)
-
+    let rawText: string
+    try {
+      rawText = await extractText(buffer, file.type)
+    } catch (err) {
+      console.error("OCR error:", err)
       await prisma.transcriptUpload.update({
         where: { id: upload.id },
-        data: { status: "completed", rawLlmResponse: "MOCK_DATA" },
-      })
-
-      return Response.json({ uploadId: upload.id })
-    }
-
-    // Determine inline_data mime type
-    const mimeType =
-      file.type === "application/pdf"
-        ? "application/pdf"
-        : file.type === "image/png"
-        ? "image/png"
-        : "image/jpeg"
-
-    const geminiResponse = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [
-              {
-                text: 'You are an OCR assistant. Extract all courses from this Thai university transcript and return ONLY a JSON array (no markdown, no explanation). Each item: { courseCode: string, courseName: string, credits: number|null, grade: string|null, semesterLabel: string|null }. courseCode is the 8-digit Thai university course code.',
-              },
-            ],
-          },
-          contents: [
-            {
-              parts: [
-                {
-                  inline_data: { mime_type: mimeType, data: base64 },
-                },
-              ],
-            },
-          ],
-          generationConfig: { maxOutputTokens: 4096 },
-        }),
-      }
-    )
-
-    if (!geminiResponse.ok) {
-      const errText = await geminiResponse.text()
-      await prisma.transcriptUpload.update({
-        where: { id: upload.id },
-        data: { status: "failed", rawLlmResponse: errText },
+        data: { status: "failed" },
       })
       return Response.json(
-        { error: `Gemini API error: ${geminiResponse.status}` },
-        { status: 502 }
+        { error: "ไม่สามารถอ่านเอกสารได้ กรุณาลองใหม่อีกครั้ง" },
+        { status: 500 }
       )
     }
 
-    const geminiData = await geminiResponse.json()
-    const rawLlmResponse =
-      geminiData.candidates?.[0]?.content?.parts?.[0]?.text ??
-      JSON.stringify(geminiData)
-
-    // Parse JSON response
-    let parsedEntries: LlmCourseEntry[]
-    try {
-      // Strip markdown fences if present
-      let jsonText = rawLlmResponse.trim()
-      jsonText = jsonText.replace(/^```json\s*/i, "").replace(/\s*```$/, "")
-      parsedEntries = JSON.parse(jsonText)
-    } catch (parseError) {
+    if (!rawText.trim()) {
       await prisma.transcriptUpload.update({
         where: { id: upload.id },
-        data: { status: "failed", rawLlmResponse },
+        data: { status: "failed", rawLlmResponse: rawText },
       })
       return Response.json(
-        {
-          error: "ไม่สามารถแปลงผลลัพธ์จาก AI ได้ กรุณาลองใหม่อีกครั้ง",
-          rawLlmResponse,
-        },
+        { error: "ไม่พบข้อความในเอกสาร กรุณาลองใหม่อีกครั้ง" },
+        { status: 422 }
+      )
+    }
+
+    const parsedEntries = parseTranscriptText(rawText)
+
+    if (parsedEntries.length === 0) {
+      await prisma.transcriptUpload.update({
+        where: { id: upload.id },
+        data: { status: "failed", rawLlmResponse: rawText },
+      })
+      return Response.json(
+        { error: "ไม่พบรายวิชาในเอกสาร กรุณาตรวจสอบไฟล์แล้วลองใหม่อีกครั้ง" },
         { status: 422 }
       )
     }
@@ -226,7 +186,7 @@ export async function POST(request: NextRequest) {
 
     await prisma.transcriptUpload.update({
       where: { id: upload.id },
-      data: { status: "completed", rawLlmResponse },
+      data: { status: "completed", rawLlmResponse: rawText },
     })
 
     return Response.json({ uploadId: upload.id })
@@ -239,8 +199,7 @@ export async function POST(request: NextRequest) {
   }
 }
 
-async function processEntries(uploadId: string, entries: LlmCourseEntry[]) {
-  // Load all courses for matching
+async function processEntries(uploadId: string, entries: CourseEntry[]) {
   const allCourses = await prisma.course.findMany()
 
   for (const entry of entries) {
@@ -249,18 +208,15 @@ async function processEntries(uploadId: string, entries: LlmCourseEntry[]) {
     const grade = entry.grade?.trim() || null
     const status = deriveStatus(grade)
 
-    // Matching logic
     let matchedCourseId: string | null = null
     let matchConfidence: number | null = null
 
-    // 1. Exact match
     const exactMatch = allCourses.find((c) => c.code === rawCode)
     if (exactMatch) {
       matchedCourseId = exactMatch.code
       matchConfidence = 1.0
     }
 
-    // 2. Normalize match (strip non-digits, pad to 8)
     if (!matchedCourseId && rawCode) {
       const normalizedRaw = normalizeCode(rawCode)
       const normalizedMatch = allCourses.find(
@@ -272,7 +228,6 @@ async function processEntries(uploadId: string, entries: LlmCourseEntry[]) {
       }
     }
 
-    // 3. Name fuzzy match
     if (!matchedCourseId && rawName) {
       let bestScore = 0
       let bestCourse = null
