@@ -1,8 +1,6 @@
 // This is your Prisma schema file,
 // learn more about it in the docs: https://pris.ly/d/prisma-schema
 
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
   provider = "prisma-client"
   output   = "../src/generated/prisma"
@@ -10,4 +8,76 @@ generator client {
 
 datasource db {
   provider = "sqlite"
+}
+
+model Category {
+  id             String     @id
+  nameTh         String
+  nameEn         String
+  parentId       String?
+  parent         Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children       Category[] @relation("CategoryHierarchy")
+  requiredCredits Float?
+  courses        Course[]
+}
+
+model Course {
+  code            String            @id
+  nameTh          String
+  nameEn          String
+  credits         Int
+  lectureHours    Int
+  labHours        Int
+  selfStudyHours  Int
+  categoryId      String
+  category        Category          @relation(fields: [categoryId], references: [id])
+  courseType      String
+  note            String?
+  prerequisites   String            @default("[]")
+  transcriptEntries TranscriptEntry[]
+}
+
+model StudyPlanEntry {
+  id            Int      @id @default(autoincrement())
+  year          Int
+  semester      Int
+  courseCode    String
+  label         String
+  credits       Float?
+  note          String?
+  isPlaceholder Boolean  @default(false)
+}
+
+model Student {
+  id          String             @id @default(cuid())
+  name        String?
+  studentCode String?
+  createdAt   DateTime           @default(now())
+  uploads     TranscriptUpload[]
+}
+
+model TranscriptUpload {
+  id             String            @id @default(cuid())
+  studentId      String?
+  student        Student?          @relation(fields: [studentId], references: [id])
+  fileName       String
+  uploadedAt     DateTime          @default(now())
+  rawLlmResponse String?
+  status         String
+  entries        TranscriptEntry[]
+}
+
+model TranscriptEntry {
+  id               String           @id @default(cuid())
+  uploadId         String
+  upload           TranscriptUpload @relation(fields: [uploadId], references: [id])
+  courseCode       String?
+  courseCodeRaw    String
+  courseNameRaw    String
+  grade            String?
+  semesterLabel    String?
+  status           String
+  matchConfidence  Float?
+  matchedCourseId  String?
+  matchedCourse    Course?          @relation(fields: [matchedCourseId], references: [code])
 }
