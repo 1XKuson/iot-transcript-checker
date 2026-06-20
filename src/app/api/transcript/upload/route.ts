@@ -1,6 +1,5 @@
 import { NextRequest } from "next/server"
 import { prisma } from "@/lib/prisma"
-import { stringSimilarity } from "string-similarity-js"
 import Tesseract from "tesseract.js"
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024 // 10MB
@@ -16,24 +15,12 @@ interface CourseEntry {
   semesterLabel: string | null
 }
 
-function deriveStatus(grade: string | null): string {
-  if (grade === "F") return "failed_grade"
-  if (grade === "W") return "withdrawn"
-  if (grade === null || grade === "") return "in_progress"
-  return "completed"
-}
-
-function normalizeCode(code: string): string {
-  return code.replace(/\D/g, "").padStart(8, "0")
-}
-
 async function extractText(buffer: Buffer, mimeType: string): Promise<string> {
   if (mimeType === "application/pdf") {
     const { PDFParse } = await import("pdf-parse")
     const parser = new PDFParse({ data: buffer })
     const result = await parser.getText()
-    const text = result.text
-    return text
+    return result.text
   }
 
   const worker = await Tesseract.createWorker("tha+eng")
@@ -102,6 +89,15 @@ function parseTranscriptText(text: string): CourseEntry[] {
   }
 
   return entries
+}
+
+export interface RawEntry {
+  id: string
+  courseCodeRaw: string
+  courseNameRaw: string
+  grade: string | null
+  credits: number | null
+  semesterLabel: string | null
 }
 
 export async function POST(request: NextRequest) {
@@ -182,82 +178,45 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    await processEntries(upload.id, parsedEntries)
+    // Create entries with pending_review status — no matching yet
+    const createdEntries = await Promise.all(
+      parsedEntries.map((entry) =>
+        prisma.transcriptEntry.create({
+          data: {
+            uploadId: upload.id,
+            courseCode: null,
+            courseCodeRaw: (entry.courseCode ?? "").trim(),
+            courseNameRaw: (entry.courseName ?? "").trim(),
+            grade: entry.grade?.trim() ?? null,
+            semesterLabel: entry.semesterLabel ?? null,
+            status: "pending_review",
+            matchedCourseId: null,
+            matchConfidence: null,
+          },
+        })
+      )
+    )
 
     await prisma.transcriptUpload.update({
       where: { id: upload.id },
-      data: { status: "completed", rawLlmResponse: rawText },
+      data: { status: "pending_review", rawLlmResponse: rawText },
     })
 
-    return Response.json({ uploadId: upload.id })
+    const entries: RawEntry[] = createdEntries.map((e) => ({
+      id: e.id,
+      courseCodeRaw: e.courseCodeRaw,
+      courseNameRaw: e.courseNameRaw,
+      grade: e.grade,
+      credits: parsedEntries.find((p) => p.courseCode === e.courseCodeRaw)?.credits ?? null,
+      semesterLabel: e.semesterLabel,
+    }))
+
+    return Response.json({ uploadId: upload.id, entries })
   } catch (error) {
     console.error("Upload error:", error)
     return Response.json(
       { error: "เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์" },
       { status: 500 }
     )
-  }
-}
-
-async function processEntries(uploadId: string, entries: CourseEntry[]) {
-  const allCourses = await prisma.course.findMany()
-
-  for (const entry of entries) {
-    const rawCode = (entry.courseCode ?? "").toString().trim()
-    const rawName = (entry.courseName ?? "").trim()
-    const grade = entry.grade?.trim() || null
-    const status = deriveStatus(grade)
-
-    let matchedCourseId: string | null = null
-    let matchConfidence: number | null = null
-
-    const exactMatch = allCourses.find((c) => c.code === rawCode)
-    if (exactMatch) {
-      matchedCourseId = exactMatch.code
-      matchConfidence = 1.0
-    }
-
-    if (!matchedCourseId && rawCode) {
-      const normalizedRaw = normalizeCode(rawCode)
-      const normalizedMatch = allCourses.find(
-        (c) => normalizeCode(c.code) === normalizedRaw
-      )
-      if (normalizedMatch) {
-        matchedCourseId = normalizedMatch.code
-        matchConfidence = 0.8
-      }
-    }
-
-    if (!matchedCourseId && rawName) {
-      let bestScore = 0
-      let bestCourse = null
-      for (const course of allCourses) {
-        const scoreTh = stringSimilarity(rawName, course.nameTh)
-        const scoreEn = stringSimilarity(rawName, course.nameEn)
-        const score = Math.max(scoreTh, scoreEn)
-        if (score > bestScore) {
-          bestScore = score
-          bestCourse = course
-        }
-      }
-      if (bestCourse && bestScore > 0.3) {
-        matchedCourseId = bestCourse.code
-        matchConfidence = bestScore * 0.6
-      }
-    }
-
-    await prisma.transcriptEntry.create({
-      data: {
-        uploadId,
-        courseCode: rawCode || null,
-        courseCodeRaw: rawCode,
-        courseNameRaw: rawName,
-        grade,
-        semesterLabel: entry.semesterLabel || null,
-        status,
-        matchedCourseId,
-        matchConfidence,
-      },
-    })
   }
 }
